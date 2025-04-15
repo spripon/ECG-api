@@ -1,235 +1,334 @@
-from flask import Flask, request, send_file, jsonify # Ajout de jsonify pour les erreurs
+# -*- coding: utf-8 -*-
+# Version optimisée le 2025-04-15
+
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
 from io import BytesIO
 import os
+import traceback # Pour un meilleur logging des erreurs
 
 app = Flask(__name__)
-CORS(app) # Active CORS pour toutes les routes, ajustez si nécessaire pour plus de sécurité
+# Configuration CORS (ajuster 'origins' pour plus de sécurité en production si nécessaire)
+CORS(app, resources={r"/process": {"origins": "*"}}) # Permet les requêtes POST sur /process depuis n'importe quelle origine
 
-# Fonction utilitaire pour ordonner les points du contour (coin sup-gauche, sup-droit, inf-droit, inf-gauche)
+# Fonction utilitaire pour ordonner les points du contour (TL, TR, BR, BL)
 def order_points(pts):
+    """Ordonne les 4 points d'un contour pour la transformation de perspective."""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1)
-
-    rect[0] = pts[np.argmin(s)] # Point avec la plus petite somme (x+y) -> sup-gauche
-    rect[2] = pts[np.argmax(s)] # Point avec la plus grande somme (x+y) -> inf-droit
-
-    # Pour les points sup-droit et inf-gauche, on regarde la différence (y-x)
-    rect[1] = pts[np.argmin(diff)] # Point avec la plus petite différence -> sup-droit
-    rect[3] = pts[np.argmax(diff)] # Point avec la plus grande différence -> inf-gauche
-
+    rect[0] = pts[np.argmin(s)] # Coin Supérieur Gauche (Top-Left)
+    rect[2] = pts[np.argmax(s)] # Coin Inférieur Droit (Bottom-Right)
+    rect[1] = pts[np.argmin(diff)] # Coin Supérieur Droit (Top-Right)
+    rect[3] = pts[np.argmax(diff)] # Coin Inférieur Gauche (Bottom-Left)
     return rect
+
+# Fonction pour l'amélioration du contraste et la binarisation
+def enhance_and_binarize(image_gray):
+    """Applique CLAHE et seuillage adaptatif pour améliorer le contraste et binariser."""
+    if image_gray is None or image_gray.size == 0:
+        print("DEBUG: enhance_and_binarize reçu une image vide.")
+        return None
+
+    h, w = image_gray.shape
+    print(f"DEBUG: enhance_and_binarize - Dimensions image entrée: {w}x{h}")
+
+    # 1. Amélioration du contraste local avec CLAHE
+    print("DEBUG: Application de CLAHE...")
+    try:
+        # clipLimit: Limite l'amplification du contraste (évite le bruit excessif)
+        # tileGridSize: Taille de la grille locale pour l'égalisation
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) # clipLimit légèrement augmenté
+        enhanced_gray = clahe.apply(image_gray)
+        print("DEBUG: CLAHE appliqué.")
+    except Exception as e:
+        print(f"ERREUR: Échec de l'application CLAHE: {e}")
+        return image_gray # Retourner l'image grise originale si CLAHE échoue
+
+    # 2. Binarisation avec seuillage adaptatif
+    print("DEBUG: Application du seuillage adaptatif...")
+    try:
+        # blockSize: Taille du voisinage (impair). Ajuster si les lignes sont trop fines/épaisses.
+        # C: Constante soustraite de la moyenne. Ajuster pour plus/moins de noir.
+        block_size = 15 # Taille de voisinage
+        C_value = 4     # Constante de soustraction (légèrement augmentée)
+        binary_image = cv2.adaptiveThreshold(enhanced_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                              cv2.THRESH_BINARY_INV, block_size, C_value) # THRESH_BINARY_INV pour fond blanc/tracé noir
+        print("DEBUG: Seuil adaptatif appliqué.")
+
+        # Optionnel : Nettoyage mineur du bruit (peut enlever des petits points)
+        # kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        # binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel_clean, iterations=1)
+        # print("DEBUG: Nettoyage morphologique (open) appliqué.")
+
+    except Exception as e:
+        print(f"ERREUR: Échec du seuillage adaptatif: {e}")
+        # Fallback: essayer un seuil global Otsu sur l'image améliorée par CLAHE
+        try:
+             print("DEBUG: Tentative de fallback avec seuil Otsu...")
+             _, binary_image = cv2.threshold(enhanced_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+             print("DEBUG: Seuil Otsu appliqué avec succès.")
+        except Exception as e_otsu:
+             print(f"ERREUR: Échec du seuil Otsu également: {e_otsu}")
+             return enhanced_gray # Dernier recours: retourner l'image CLAHE
+
+    return binary_image
 
 # Fonction principale de traitement de l'image ECG
 def process_ecg(img_bgr):
-    # 0. Copie de l'original pour le retour en cas d'échec partiel
-    original_for_fallback = img_bgr.copy()
+    """Traite une image ECG pour détecter, redresser, et améliorer le quadrillage."""
+    print("--- Début du traitement ECG ---")
+    # 0. Copie et Vérification initiale
+    if img_bgr is None or img_bgr.size == 0:
+        print("ERREUR: process_ecg - Image d'entrée invalide.")
+        return None
+    # Garder une copie pour le fallback ultime si tout échoue
+    original_for_ultimate_fallback = img_bgr.copy()
 
-    # 1. Vérifier l'orientation et appliquer une rotation de -90 degrés si nécessaire
-    # On suppose que l'ECG doit être plus large que haut (dérivations horizontales)
-    h, w = img_bgr.shape[:2]
-    rotated = False
-    if h > w:
-        print("Image détectée comme étant en portrait, rotation de -90 degrés.")
-        img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        rotated = True
-        # Mettre à jour h et w après rotation
-        h, w = img_bgr.shape[:2]
-
-    # Garder une copie de l'image potentiellement tournée pour le warp final
+    # 1. Rotation si nécessaire (pour orientation paysage)
+    h_orig, w_orig = img_bgr.shape[:2]
+    print(f"DEBUG: Dimensions originales: {w_orig}x{h_orig}")
+    if h_orig > w_orig * 1.1: # Rotation si significativement plus haut que large
+        print("INFO: Rotation de l'image de -90 degrés.")
+        try:
+            img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        except Exception as e:
+            print(f"ERREUR: Echec de la rotation: {e}")
+            img_bgr = original_for_ultimate_fallback # Revenir à l'original si rotation échoue
     original_rotated = img_bgr.copy()
+    h, w = original_rotated.shape[:2]
+    print(f"DEBUG: Dimensions après rotation potentielle: {w}x{h}")
 
-    # 2. Détection automatique de la couleur du quadrillage (Multi-couleurs)
-    # Appliquer un léger flou pour réduire le bruit
-    img_blurred = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    # Convertir en espace colorimétrique HSV (plus facile pour détecter des plages de couleurs)
-    hsv = cv2.cvtColor(img_blurred, cv2.COLOR_BGR2HSV)
+    # --- Fonction Fallback interne ---
+    def get_enhanced_fallback(image_to_process):
+        print("INFO: Utilisation du fallback: Amélioration de l'image entière (sans recadrage/perspective).")
+        try:
+            gray_fallback = cv2.cvtColor(image_to_process, cv2.COLOR_BGR2GRAY)
+            enhanced_fallback = enhance_and_binarize(gray_fallback)
+            return enhanced_fallback
+        except Exception as e_fallback:
+             print(f"ERREUR: Échec critique dans get_enhanced_fallback: {e_fallback}")
+             # Ultime recours: convertir l'original en gris simple
+             try:
+                 return cv2.cvtColor(original_for_ultimate_fallback, cv2.COLOR_BGR2GRAY)
+             except:
+                 return None # Si même ça échoue...
+    # --- Fin Fonction Fallback ---
 
-    # Définir les plages HSV pour les couleurs cibles
-    # Note: Ces plages peuvent nécessiter des ajustements fins en fonction des images réelles
-    # Rouge/Rose pâle
-    lower_red1 = np.array([0, 40, 100])     # Saturation et Value plus basses pour "pâle"
-    upper_red1 = np.array([15, 255, 255])
-    lower_red2 = np.array([165, 40, 100])   # Saturation et Value plus basses pour "pâle"
-    upper_red2 = np.array([180, 255, 255])
-    # Orange/Jaune pâle
-    lower_orange_yellow = np.array([16, 40, 100]) # Saturation et Value plus basses pour "pâle"
-    upper_orange_yellow = np.array([45, 255, 255]) # Hue jusqu'à ~45 pour couvrir jaune
+    # 2. Détection couleur (avec plages HSV optimisées)
+    print("INFO: Détection de la couleur du quadrillage (plages HSV étendues)...")
+    try:
+        img_blurred = cv2.GaussianBlur(original_rotated, (5, 5), 0)
+        hsv = cv2.cvtColor(img_blurred, cv2.COLOR_BGR2HSV)
 
-    # Créer les masques pour chaque plage
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_orange_yellow = cv2.inRange(hsv, lower_orange_yellow, upper_orange_yellow)
+        # Paramètres HSV optimisés
+        min_saturation = 15 # Encore plus bas pour les couleurs très très pâles
+        min_value = 85      # Encore plus bas pour tolérer plus d'ombre
 
-    # Combiner les masques
-    combined_mask = cv2.bitwise_or(mask_red1, mask_red2)
-    combined_mask = cv2.bitwise_or(combined_mask, mask_orange_yellow)
+        # Rouge/Rose (partie 1)
+        lower_red1 = np.array([0, min_saturation, min_value])
+        upper_red1 = np.array([15, 255, 255])
+        # Rouge/Rose (partie 2)
+        lower_red2 = np.array([165, min_saturation, min_value])
+        upper_red2 = np.array([180, 255, 255])
+        # Orange/Jaune
+        lower_orange_yellow = np.array([16, min_saturation, min_value])
+        upper_orange_yellow = np.array([50, 255, 255]) # Étendu jusqu'à H=50
 
-    # 3. Nettoyage du masque et détection du contour du quadrillage
-    # Utiliser des opérations morphologiques pour enlever le bruit et connecter les lignes du quadrillage
-    kernel = np.ones((7, 7), np.uint8) # Noyau un peu plus grand pour mieux connecter
-    mask_closed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel, iterations=2)
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_orange_yellow = cv2.inRange(hsv, lower_orange_yellow, upper_orange_yellow)
 
-    # Trouver les contours externes dans le masque nettoyé
-    # On se concentre sur le masque couleur, car Canny peut détecter les tracés ECG eux-mêmes
-    contours, hierarchy = cv2.findContours(mask_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        combined_mask = cv2.bitwise_or(mask_red1, mask_red2)
+        combined_mask = cv2.bitwise_or(combined_mask, mask_orange_yellow)
+        print("DEBUG: Masque de couleur combiné créé.")
 
-    if not contours:
-        print("Aucun contour trouvé basé sur la couleur du quadrillage.")
-        # Fallback très simple : convertir l'image (potentiellement tournée) en N&B
-        gray_fallback = cv2.cvtColor(original_rotated, cv2.COLOR_BGR2GRAY)
-        return gray_fallback # Retourner l'image N&B sans recadrage/perspective
+    except Exception as e_color:
+        print(f"ERREUR: Échec lors de la détection couleur: {e_color}")
+        return get_enhanced_fallback(original_rotated) # Fallback si détection couleur échoue
 
-    # Trouver le contour le plus grand (on suppose que c'est le quadrillage)
-    largest_contour = max(contours, key=cv2.contourArea)
+    # 3. Nettoyage masque et détection contour
+    print("INFO: Nettoyage du masque et recherche des contours...")
+    try:
+        # Noyau plus adapté pour connecter lignes fines mais pas fusionner de trop grandes zones
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)) # Rectangulaire pour connecter horizontalement
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask_processed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+        mask_processed = cv2.morphologyEx(mask_processed, cv2.MORPH_OPEN, kernel_open, iterations=2)
 
-    # Vérifier si le contour trouvé est raisonnablement grand
-    min_area_ratio = 0.1 # Exiger que le contour occupe au moins 10% de l'image
-    if cv2.contourArea(largest_contour) < min_area_ratio * h * w:
-         print(f"Le plus grand contour trouvé est trop petit (aire: {cv2.contourArea(largest_contour)}). Utilisation de l'image complète.")
-         # Fallback : convertir l'image (potentiellement tournée) en N&B
-         gray_fallback = cv2.cvtColor(original_rotated, cv2.COLOR_BGR2GRAY)
-         return gray_fallback
+        contours, hierarchy = cv2.findContours(mask_processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        print(f"DEBUG: {len(contours)} contours trouvés initialement.")
 
-    # 4. Extraction de la zone du quadrillage et correction de perspective
+        if not contours:
+            print("AVERTISSEMENT: Aucun contour trouvé basé sur la couleur.")
+            # Tentative avec Canny comme secours avant fallback complet? Non, simplifions.
+            return get_enhanced_fallback(original_rotated)
 
-    # Simplifier le contour pour obtenir les coins (si c'est un quadrilatère)
-    peri = cv2.arcLength(largest_contour, True)
-    approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True) # 0.02 est un facteur d'epsilon courant
+        # Filtrer les contours trop petits avant de chercher le plus grand
+        min_contour_area = 0.05 * h * w # Exiger au moins 5% de l'aire de l'image
+        large_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_contour_area]
 
+        if not large_contours:
+            print("AVERTISSEMENT: Aucun contour suffisamment grand trouvé.")
+            return get_enhanced_fallback(original_rotated)
+
+        largest_contour = max(large_contours, key=cv2.contourArea)
+        print(f"DEBUG: Aire du plus grand contour: {cv2.contourArea(largest_contour)}")
+
+    except Exception as e_contour:
+        print(f"ERREUR: Échec lors du traitement des contours: {e_contour}")
+        return get_enhanced_fallback(original_rotated)
+
+    # 4. Correction de Perspective / Recadrage
+    print("INFO: Tentative de correction de perspective...")
     warped = None
-    # Si on a bien 4 coins, on applique la correction de perspective
-    if len(approx) == 4:
-        print("Contour à 4 points détecté, application de la correction de perspective.")
-        pts = np.array([p[0] for p in approx], dtype="float32")
-        rect = order_points(pts)
-        (tl, tr, br, bl) = rect
+    try:
+        peri = cv2.arcLength(largest_contour, True)
+        # Utiliser un epsilon relatif plus petit peut aider à préserver les 4 coins
+        approx = cv2.approxPolyDP(largest_contour, 0.015 * peri, True) # Epsilon ajusté
 
-        # Calculer la largeur et la hauteur de la nouvelle image redressée
-        widthA = np.linalg.norm(br - bl)
-        widthB = np.linalg.norm(tr - tl)
-        maxWidth = int(max(widthA, widthB))
+        if len(approx) == 4:
+            print(f"INFO: Contour à 4 points trouvé ({len(approx)} points). Application du warp perspective.")
+            pts = np.array([p[0] for p in approx], dtype="float32")
+            rect = order_points(pts)
+            (tl, tr, br, bl) = rect
 
-        heightA = np.linalg.norm(tr - br)
-        heightB = np.linalg.norm(tl - bl)
-        maxHeight = int(max(heightA, heightB))
+            # Calcul dimensions de sortie (méthode stable)
+            widthA = np.linalg.norm(br - bl); widthB = np.linalg.norm(tr - tl)
+            maxWidth = int(max(widthA, widthB))
+            heightA = np.linalg.norm(tr - br); heightB = np.linalg.norm(tl - bl)
+            maxHeight = int(max(heightA, heightB))
 
-        # Définir les points de destination pour l'image redressée (vue de dessus)
-        dst = np.array([
-            [0, 0],                  # Coin sup-gauche
-            [maxWidth - 1, 0],       # Coin sup-droit
-            [maxWidth - 1, maxHeight - 1], # Coin inf-droit
-            [0, maxHeight - 1]       # Coin inf-gauche
-            ], dtype="float32")
+            if maxWidth > 0 and maxHeight > 0:
+                dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+                M = cv2.getPerspectiveTransform(rect, dst)
+                warped = cv2.warpPerspective(original_rotated, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+                print("DEBUG: Warp perspective appliqué.")
+            else:
+                 print("AVERTISSEMENT: Dimensions calculées pour warp sont invalides.")
+                 warped = None # Forcer le fallback au bounding box
 
-        # Calculer la matrice de transformation perspective
-        M = cv2.getPerspectiveTransform(rect, dst)
-        # Appliquer la transformation à l'image originale (potentiellement tournée)
-        warped = cv2.warpPerspective(original_rotated, M, (maxWidth, maxHeight))
+        # Si approx n'a pas 4 points OU si warp a échoué
+        if warped is None:
+             if len(approx) != 4:
+                 print(f"INFO: Contour trouvé avec {len(approx)} points. Utilisation du rectangle englobant.")
+             else: # warped est None mais len(approx) == 4, erreur de calcul dims?
+                 print("AVERTISSEMENT: Echec du warp malgré 4 points détectés. Utilisation du rectangle englobant.")
+
+             x, y, w_rect, h_rect = cv2.boundingRect(largest_contour)
+             # Recadrage direct sans padding pour maximiser la zone détectée
+             if h_rect > 0 and w_rect > 0:
+                 warped = original_rotated[y:y + h_rect, x:x + w_rect]
+                 print("DEBUG: Recadrage par Bounding Box appliqué.")
+             else:
+                 print("AVERTISSEMENT: Rectangle englobant invalide.")
+                 warped = None # Échec du recadrage aussi
+
+    except Exception as e_warp:
+        print(f"ERREUR: Échec lors du redressement/recadrage: {e_warp}")
+        warped = None # Assurer que warped est None pour déclencher le fallback final
+
+    # 5. Conversion N&B et Amélioration finale
+    if warped is not None and warped.size > 0:
+        print("INFO: Conversion en N&B et Amélioration de l'image redressée/recadrée.")
+        try:
+            warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+            final_image = enhance_and_binarize(warped_gray)
+        except Exception as e_enhance:
+            print(f"ERREUR: Échec de l'amélioration finale sur l'image redressée: {e_enhance}")
+            final_image = None # Déclenchera le fallback ci-dessous
+
+        if final_image is None or final_image.size == 0:
+             print("AVERTISSEMENT: L'amélioration a échoué. Utilisation du fallback.")
+             final_image = get_enhanced_fallback(original_rotated) # Appliquer fallback sur l'image tournée
+        else:
+             print("INFO: Traitement terminé avec succès (image redressée/améliorée).")
 
     else:
-        print(f"Contour détecté avec {len(approx)} points (pas 4). Utilisation du rectangle englobant.")
-        # Fallback si ce n'est pas un quadrilatère : utiliser le rectangle englobant
-        x, y, w_rect, h_rect = cv2.boundingRect(largest_contour)
-        # Recadrer l'image originale (potentiellement tournée)
-        # Ajouter un petit padding pour ne pas couper les bords si le boundingRect est trop juste
-        padding = 5
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(w, x + w_rect + padding) # w est la largeur de original_rotated
-        y2 = min(h, y + h_rect + padding) # h est la hauteur de original_rotated
-        warped = original_rotated[y1:y2, x1:x2]
+        # Si warped est None ou vide (échec perspective ET bounding box)
+        print("AVERTISSEMENT: Échec du redressement ET du recadrage. Utilisation du fallback sur image entière.")
+        final_image = get_enhanced_fallback(original_rotated)
 
-    # 5. Conversion finale en monochrome (Noir et Blanc)
-    if warped is not None and warped.size > 0 :
-        print("Conversion de l'image traitée en niveaux de gris.")
-        final_image = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        # Optionnel: Améliorer le contraste si nécessaire (peut aider pour la lecture des tracés)
-        # final_image = cv2.equalizeHist(final_image) # Histogram Equalization
-        # Ou utiliser CLAHE pour une amélioration locale du contraste
-        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        # final_image = clahe.apply(final_image)
-    else:
-        print("Warping a échoué ou produit une image vide. Retour à l'image grise de secours.")
-        final_image = cv2.cvtColor(original_rotated, cv2.COLOR_BGR2GRAY) # Fallback N&B de l'image tournée
-
+    print("--- Fin du traitement ECG ---")
     return final_image
 
+# --- Routes Flask ---
 @app.route("/", methods=["GET"])
 def index():
-    # Simple page d'accueil pour vérifier que l'API tourne
-    return "<h3>API de traitement ECG est active. Utilisez POST /process avec une image.</h3>"
+    """Page d'accueil simple pour vérifier que l'API tourne."""
+    return "<h3>API de traitement ECG v2.1 (HSV optimisé) est active. Utilisez POST /process avec une image.</h3>", 200
 
 @app.route("/process", methods=["POST"])
 def process_image_route():
-    # Vérifier si un fichier 'image' est présent dans la requête
+    """Route principale pour recevoir une image et retourner l'ECG traité."""
+    print("--- Requête reçue sur /process ---")
     if 'image' not in request.files:
-        print("Erreur: Aucune image fournie dans la requête.")
+        print("ERREUR API: Aucun fichier 'image' fourni.")
         return jsonify({"error": "Aucun fichier image fourni ('image' attendu)"}), 400
 
     file = request.files['image']
 
-    # Vérifier si le fichier a un nom (basique)
-    if file.filename == '':
-        print("Erreur: Nom de fichier vide.")
-        return jsonify({"error": "Nom de fichier vide"}), 400
+    if not file or file.filename == '':
+        print("ERREUR API: Fichier image invalide ou nom de fichier vide.")
+        return jsonify({"error": "Fichier image invalide ou nom de fichier vide"}), 400
+
+    print(f"INFO: Fichier reçu: {file.filename}, Type: {file.mimetype}")
 
     try:
-        # Lire les données de l'image depuis le buffer en mémoire
+        # Lire en mémoire
         img_data = file.read()
-        # Convertir les données brutes en un tableau numpy
         np_arr = np.frombuffer(img_data, np.uint8)
-        # Décoder le tableau numpy en une image OpenCV (en couleur BGR par défaut)
+        # Décoder l'image en couleur (BGR)
         img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if img_bgr is None:
-            print("Erreur: Impossible de décoder l'image. Format non supporté ou fichier corrompu?")
+            print("ERREUR API: Impossible de décoder l'image. Format non supporté ou fichier corrompu?")
             return jsonify({"error": "Impossible de décoder le fichier image"}), 400
 
-        # Appeler la fonction de traitement principale
-        processed_image_gray = process_ecg(img_bgr)
+        # --- Appel de la fonction de traitement principale ---
+        processed_image_binary = process_ecg(img_bgr)
+        # ----------------------------------------------------
 
-        # Vérifier si le traitement a retourné une image valide
-        if processed_image_gray is None or processed_image_gray.size == 0:
-             print("Erreur: Le traitement n'a pas produit d'image valide.")
-             return jsonify({"error": "Échec du traitement de l'image"}), 500
+        if processed_image_binary is None or processed_image_binary.size == 0:
+             print("ERREUR API: Le traitement interne n'a pas produit d'image valide.")
+             return jsonify({"error": "Échec du traitement interne de l'image"}), 500
 
-        # Encoder l'image traitée (monochrome) en format JPEG pour l'envoi
-        # Utiliser PNG pourrait être mieux pour du N&B sans perte, mais JPEG est courant
-        is_success, buffer = cv2.imencode(".jpg", processed_image_gray, [cv2.IMWRITE_JPEG_QUALITY, 90]) # Qualité 90
+        # Encoder l'image finale (binaire N&B) en PNG (sans perte)
+        is_success, buffer = cv2.imencode(".png", processed_image_binary)
 
         if not is_success:
-            print("Erreur: Impossible d'encoder l'image traitée en JPEG.")
+            print("ERREUR API: Impossible d'encoder l'image traitée en PNG.")
             return jsonify({"error": "Échec de l'encodage de l'image résultat"}), 500
 
         # Créer un objet BytesIO pour envoyer le buffer comme un fichier
         img_byte_io = BytesIO(buffer.tobytes())
 
-        # Envoyer le fichier image en réponse
-        print("Envoi de l'image traitée.")
+        print("INFO: Envoi de l'image PNG traitée.")
         return send_file(
             img_byte_io,
-            mimetype='image/jpeg',
-            as_attachment=False # Envoyer inline plutôt qu'en téléchargement
-            # download_name='processed_ecg.jpg' # Nom si as_attachment=True
+            mimetype='image/png',
+            as_attachment=False # Envoyer 'inline'
+            # download_name='processed_ecg.png' # Optionnel si as_attachment=True
         )
 
+    except cv2.error as cv_err:
+         print(f"ERREUR API: Erreur OpenCV: {cv_err}")
+         traceback.print_exc()
+         return jsonify({"error": f"Erreur lors du traitement d'image OpenCV: {cv_err}"}), 500
     except Exception as e:
-        # Capturer les erreurs potentielles pendant la lecture ou le traitement
-        print(f"Erreur serveur lors du traitement de l'image: {e}")
-        import traceback
+        # Capturer les autres erreurs potentielles
+        print(f"ERREUR API: Erreur serveur inattendue: {e}")
         traceback.print_exc() # Affiche la trace complète dans les logs serveur
         return jsonify({"error": f"Erreur interne du serveur: {e}"}), 500
 
+# Point d'entrée pour l'exécution directe ou via un serveur WSGI (comme Gunicorn)
 if __name__ == "__main__":
-    # Récupérer le port depuis les variables d'environnement (pour Railway/Heroku etc.)
-    # Utiliser 8080 par défaut si PORT n'est pas défini
+    # Récupérer le port depuis les variables d'environnement (pour Railway, Heroku, etc.)
     port = int(os.environ.get("PORT", 8080))
-    # Lancer l'application Flask
-    # host='0.0.0.0' permet d'écouter sur toutes les interfaces réseau disponibles
-    print(f"Démarrage du serveur Flask sur le port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False) # Mettre debug=True SEULEMENT en développement local
+    # Lancer l'application Flask en mode développement (debug=False pour prod)
+    # host='0.0.0.0' est important pour écouter sur toutes les interfaces dans un conteneur
+    print(f"INFO: Démarrage du serveur Flask sur http://0.0.0.0:{port}")
+    # Mettre debug=True SEULEMENT pour le développement local, JAMAIS en production.
+    app.run(host="0.0.0.0", port=port, debug=False)
