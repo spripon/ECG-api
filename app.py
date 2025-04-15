@@ -39,25 +39,41 @@ def process_ecg(img_bgr):
         # Mettre à jour h et w après rotation
         h, w = img_bgr.shape[:2]
 
-    # Garder une copie de l'image potentiellement tournée pour le warp final
+    # Garder une copie de l'image potentiellement tournée pour le warp final et la détection couleur
     original_rotated = img_bgr.copy()
 
-    # 2. Détection automatique de la couleur du quadrillage (Multi-couleurs)
-    # Appliquer un léger flou pour réduire le bruit
-    img_blurred = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    # Convertir en espace colorimétrique HSV (plus facile pour détecter des plages de couleurs)
+    # --- DÉBUT DU BLOC INTÉGRÉ ---
+
+    # 2. Détection couleur (pour trouver la zone d'intérêt) - PLAGES HSV OPTIMISÉES
+    print("Détection de la couleur du quadrillage (plages HSV étendues)...")
+    img_blurred = cv2.GaussianBlur(original_rotated, (5, 5), 0)
     hsv = cv2.cvtColor(img_blurred, cv2.COLOR_BGR2HSV)
 
-    # Définir les plages HSV pour les couleurs cibles
-    # Note: Ces plages peuvent nécessiter des ajustements fins en fonction des images réelles
-    # Rouge/Rose pâle
-    lower_red1 = np.array([0, 40, 100])     # Saturation et Value plus basses pour "pâle"
+    # --- Plages HSV ajustées pour plus de robustesse ---
+    # Teinte (H): Les plages 0-15 (rouges/roses), 165-180 (rouges/roses) et 16-45(oranges/jaunes)
+    #            sont conservées car elles couvrent bien les couleurs cibles.
+
+    # Saturation (S): Abaissée à 20 (au lieu de 40) pour inclure les couleurs très pâles/délavées.
+    #                 Maximum reste à 255 pour les couleurs vives/intenses.
+    min_saturation = 20
+
+    # Valeur (V): Abaissée à 90 (au lieu de 100) pour être un peu plus tolérant aux légères ombres
+    #             ou aux impressions moins lumineuses. Maximum reste à 255.
+    min_value = 90
+
+    # Définition des nouvelles plages
+    # [source: 14] Rouge/Rose (partie 1: près de 0 degrés)
+    lower_red1 = np.array([0, min_saturation, min_value])
     upper_red1 = np.array([15, 255, 255])
-    lower_red2 = np.array([165, 40, 100])   # Saturation et Value plus basses pour "pâle"
+
+    # [source: 15] Rouge/Rose (partie 2: près de 180 degrés)
+    lower_red2 = np.array([165, min_saturation, min_value])
     upper_red2 = np.array([180, 255, 255])
-    # Orange/Jaune pâle
-    lower_orange_yellow = np.array([16, 40, 100]) # Saturation et Value plus basses pour "pâle"
-    upper_orange_yellow = np.array([45, 255, 255]) # Hue jusqu'à ~45 pour couvrir jaune
+
+    # [source: 16] Orange/Jaune
+    lower_orange_yellow = np.array([16, min_saturation, min_value])
+    # Vous pourriez étendre jusqu'à 50 ou 55 si certains jaunes tirent vers le vert
+    upper_orange_yellow = np.array([45, 255, 255])
 
     # Créer les masques pour chaque plage
     mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
@@ -65,10 +81,14 @@ def process_ecg(img_bgr):
     mask_orange_yellow = cv2.inRange(hsv, lower_orange_yellow, upper_orange_yellow)
 
     # Combiner les masques
+    print("Combinaison des masques de couleur...")
     combined_mask = cv2.bitwise_or(mask_red1, mask_red2)
     combined_mask = cv2.bitwise_or(combined_mask, mask_orange_yellow)
 
+    # --- FIN DU BLOC INTÉGRÉ ---
+
     # 3. Nettoyage du masque et détection du contour du quadrillage
+    print("Nettoyage du masque et recherche des contours...")
     # Utiliser des opérations morphologiques pour enlever le bruit et connecter les lignes du quadrillage
     kernel = np.ones((7, 7), np.uint8) # Noyau un peu plus grand pour mieux connecter
     mask_closed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
@@ -233,3 +253,4 @@ if __name__ == "__main__":
     # host='0.0.0.0' permet d'écouter sur toutes les interfaces réseau disponibles
     print(f"Démarrage du serveur Flask sur le port {port}")
     app.run(host="0.0.0.0", port=port, debug=False) # Mettre debug=True SEULEMENT en développement local
+
