@@ -1,4 +1,6 @@
 flask
 flask-cors
 numpy
-opencv-python-headless
+opencv-python-headless   # vision + pré‑traitement
+openai>=1.13             # SDK v1 avec vision
+python-dotenv            # charge .env en local (facultatif)
