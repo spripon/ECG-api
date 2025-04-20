@@ -85,9 +85,28 @@ def detect_vision(img):
 # ------------ enhance ------------
 
 def enhance(img):
-    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    bw = cv2.adaptiveThreshold(g,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY,35,7)
-    if np.mean(bw[:30,:30])<128: bw=cv2.bitwise_not(bw)
+    # --- mise en niveaux de gris
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # --- suppression douce du fond quadrillé (background subtraction)
+    bg   = cv2.medianBlur(gray, 51)          # rayon large ~ quadrillage
+    flat = cv2.subtract(gray, bg)            # enlève la dominante quadrillage
+    flat = cv2.normalize(flat, None, 0, 255, cv2.NORM_MINMAX)
+
+    # --- léger un‑sharp mask pour rehausser le tracé ECG
+    blur  = cv2.GaussianBlur(flat, (0, 0), 3)
+    sharp = cv2.addWeighted(flat, 1.8, blur, -0.8, 0)
+
+    # --- seuillage adaptatif soft : bloc 51×51, C = 3
+    bw = cv2.adaptiveThreshold(sharp, 255,
+                               cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY,
+                               51, 3)
+
+    # --- inversion automatique si fond sombre
+    if np.mean(bw[:30, :30]) < 128:
+        bw = cv2.bitwise_not(bw)
+
     return bw
 
 # ------------ pipeline ------------
