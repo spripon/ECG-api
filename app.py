@@ -1,266 +1,151 @@
 """
-ECG‑API  –  Flask + OpenCV + OpenAI Vision
-Version : avril 2025 – spripon
-Fonctions :
-  • rotation automatique portrait → paysage
-  • GPT‑4o Vision → polygone du quadrillage (bande blanche & marges ignorées)
-  • crop + warp + contraste + dé‑shadow + binarisation propre
+ECG‑API – Flask + OpenCV + GPT‑4o Vision
+© spripon – mai 2025
 """
 
+# ───────────── imports ─────────────
 import os, base64, json, cv2, numpy as np
 from io import BytesIO
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from openai import OpenAI
 
-# ─────────────────── CONFIG ────────────────────
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-PREFERRED_MODEL = os.getenv("MODEL_NAME", "gpt-4o")
-MAX_DIM_VISION  = int(os.getenv("VISION_MAX_DIM", "1600"))
+# ───────────── config ──────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VISION_MODEL   = os.getenv("MODEL_NAME", "gpt-4o")   # gpt‑4o / gpt‑4o‑mini …
 
+MAX_DIM_VISION = 1600                                # ≤ 1600 px → coût min
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-CANDIDATE_MODELS = [
-    PREFERRED_MODEL, "gpt-4o", "gpt-4o-mini",
-    "gpt-4-turbo", "gpt-4o-preview", "gpt-4-vision-preview"
-]
 
-def pick_first_available_model() -> str | None:
-    if client is None:
-        return None
-    try:
-        remote = {m.id for m in client.models.list().data}
-    except Exception:
-        remote = set()
-    for m in CANDIDATE_MODELS:
-        if m in remote:
-            return m
-    # dernier recours : ping 1 token
-    for m in CANDIDATE_MODELS:
-        try:
-            client.chat.completions.create(
-                model=m,
-                messages=[{"role":"user","content":[{"type":"text","text":"ping"}]}],
-                max_tokens=1
-            )
-            return m
-        except Exception:
-            continue
-    return None
-
-VISION_MODEL = pick_first_available_model()
-print(("✅  Modèle Vision : " + VISION_MODEL)
-      if VISION_MODEL else "⚠️  Aucun modèle Vision ; fallback HSV")
-
-# ───────────────── FLASK APP ───────────────────
 app = Flask(__name__)
-CORS(app)   # ouvert pour Lovable.dev
+CORS(app)
 
-# ───────── UTILITAIRES OPENCV ──────────
-def order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4,2), dtype="float32")
-    s, d = pts.sum(1), np.diff(pts, axis=1)
-    rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
-    rect[1], rect[3] = pts[np.argmin(d)], pts[np.argmax(d)]
+# ───────── utilitaires cv2 ─────────
+def order_pts(pts):
+    rect = np.zeros((4,2),dtype="float32")
+    s, d = pts.sum(1), np.diff(pts,axis=1)
+    rect[0],rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
+    rect[1],rect[3] = pts[np.argmin(d)], pts[np.argmax(d)]
     return rect
 
-# ---------- Vision : polygon ----------
-def detect_grid_openai(img_bgr: np.ndarray) -> dict | None:
-    if VISION_MODEL is None:
-        return None
+# ─────── crop bande blanche FFT ────
+def crop_to_grid(gray):
+    h,w = gray.shape
+    f   = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log(np.abs(f)+1)
+    proj= cv2.GaussianBlur(mag.mean(1),(51,1),0)
+    peak= int(np.argmax(proj))
+    top = max(0, peak - int(0.45*h))
+    bot = min(h, peak + int(0.45*h))
+    return gray[top:bot]
 
-    h0, w0 = img_bgr.shape[:2]
-    scale  = 1.0
-    if max(h0, w0) > MAX_DIM_VISION:
-        scale = MAX_DIM_VISION / max(h0, w0)
-        img_r = cv2.resize(img_bgr, (int(w0*scale), int(h0*scale)))
-    else:
-        img_r = img_bgr
+# ───── Vision → bbox quadrillage ───
+def detect_grid(img):
+    if client is None: return None
+    h0,w0 = img.shape[:2]
+    scale = 1.0
+    if max(h0,w0) > MAX_DIM_VISION:
+        scale = MAX_DIM_VISION / max(h0,w0)
+        img_r = cv2.resize(img,(int(w0*scale),int(h0*scale)))
+    else: img_r = img
+    ok,buf=cv2.imencode(".png",img_r); b64=base64.b64encode(buf).decode()
 
-    ok, buf = cv2.imencode(".png", img_r)
-    if not ok:
-        return None
-    b64 = base64.b64encode(buf).decode()
-
-    messages = [{
-        "role": "user",
-        "content": [
+    messages=[{
+        "role":"user",
+        "content":[
             {"type":"text",
              "text":(
-                 "Repère sur la photo UNIQUEMENT la zone quadrillée rose/orange "
-                 "où l’on voit les 12 dérivations ECG (D1‑D3, aVR‑aVF, V1‑V6). "
-                 "Ignore la bande blanche du haut, les marges latérales et le bas "
-                 "qui ne présentent pas de quadrillage. "
-                 "Réponds EXCLUSIVEMENT par un objet JSON "
-                 "{\"points\":[{\"x\":int,\"y\":int},…]} contenant 4 à 8 sommets "
-                 "dans l’ordre horaire."
-             )},
+               "Délimite UNIQUEMENT la zone quadrillée rose/orange contenant les 12 "
+               "dérivations ECG (D1‑D3, aVR‑aVF, V1‑V6). "
+               "Ignore bande blanche du haut, marges latérales, bas sans quadrillage. "
+               "Renvoie JSON : {\"points\":[{\"x\":int,\"y\":int},…]} 4‑8 sommets.")},
             {"type":"image_url",
-             "image_url":{"url":f"data:image/png;base64,{b64}"}}
-        ]
-    }]
+             "image_url":{"url":f"data:image/png;base64,{b64}"}}]}]
 
     tools=[{
         "type":"function",
         "function":{
             "name":"set_grid",
             "parameters":{
-                "type":"object",
-                "properties":{
-                    "points":{
-                        "type":"array",
-                        "items":{
-                            "type":"object",
-                            "properties":{"x":{"type":"integer"},
-                                          "y":{"type":"integer"}},
-                            "required":["x","y"]},
-                        "minItems":4,
-                        "maxItems":8}},
-                "required":["points"]
-            }
-        }
-    }]
+              "type":"object",
+              "properties":{"points":{"type":"array",
+                                      "items":{"type":"object",
+                                               "properties":{"x":{"type":"integer"},
+                                                             "y":{"type":"integer"}},
+                                               "required":["x","y"]},
+                                      "minItems":4,"maxItems":8}},
+              "required":["points"]}}}]
 
-    try:
-        rsp = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice={"type":"function","function":{"name":"set_grid"}},
-            temperature=0
-        )
-        call = rsp.choices[0].message.tool_calls[0]
-        args = call.function.arguments
-        if isinstance(args, str):
-            args = json.loads(args)
-        pts = args.get("points", [])
-        if len(pts) < 4:
-            return None
-        xs = [p["x"] for p in pts]; ys = [p["y"] for p in pts]
-        x, y = min(xs), min(ys)
-        w, h = max(xs)-x, max(ys)-y
-        # filtre : aire ≥20 % et ratio largeur/hauteur raisonnable
-        if w*h < 0.20*w0*h0 or w/h > 2.2:
-            return None
-        return {"x": int(x/scale), "y": int(y/scale),
-                "w": int(w/scale), "h": int(h/scale)}
-    except Exception as e:
-        print("Vision API error:", e)
-        return None
+    rsp=client.chat.completions.create(
+        model=VISION_MODEL,messages=messages,tools=tools,
+        tool_choice={"type":"function","function":{"name":"set_grid"}},
+        temperature=0)
+    pts=rsp.choices[0].message.tool_calls[0].function.arguments
+    if isinstance(pts,str): pts=json.loads(pts)
+    pts=pts["points"];        xs=[p["x"] for p in pts]; ys=[p["y"] for p in pts]
+    x,y=min(xs),min(ys); w=max(xs)-x; h=max(ys)-y
+    if w*h < 0.20*w0*h0 or w/h>2.2: return None
+    return {"x":int(x/scale),"y":int(y/scale),
+            "w":int(w/scale),"h":int(h/scale),"poly":[
+            {"x":int(p["x"]/scale),"y":int(p["y"]/scale)} for p in pts]}
 
-# ---------- Fallback HSV ----------
-def hsv_fallback(img_bgr: np.ndarray) -> np.ndarray:
-    blur = cv2.GaussianBlur(img_bgr, (5,5), 0)
-    hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    sat, val = 20, 90
-    ranges = [
-        ([  0, sat, val], [15, 255,255]),
-        ([165, sat, val], [180,255,255]),
-        ([ 16, sat, val], [45, 255,255])
-    ]
-    mask = None
-    for lo,hi in ranges:
-        cur = cv2.inRange(hsv, np.array(lo), np.array(hi))
-        mask = cur if mask is None else cv2.bitwise_or(mask, cur)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8), 3)
-    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return img_bgr
-    x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
-    return img_bgr[y:y+h, x:x+w]
+# ───── warp perspective ─────
+def four_point_warp(roi, poly):
+    if len(poly)<4: return roi
+    rect=order_pts(np.array([[p["x"],p["y"]] for p in poly],dtype="float32"))
+    (tl,tr,br,bl)=rect
+    w=int(max(np.linalg.norm(br-bl),np.linalg.norm(tr-tl)))
+    h=int(max(np.linalg.norm(tr-br),np.linalg.norm(tl-bl)))
+    dst=np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]],dtype="float32")
+    M=cv2.getPerspectiveTransform(rect,dst)
+    return cv2.warpPerspective(roi,M,(w,h))
 
-# ---------- Perspective ----------
-def perspective_or_bbox(roi: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    cnts,_ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return roi
-    c   = max(cnts, key=cv2.contourArea)
-    peri= cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, 0.02*peri, True)
-    if len(approx) == 4:
-        rect = order_points(np.array([p[0] for p in approx]))
-        (tl,tr,br,bl) = rect
-        w = int(max(np.linalg.norm(br-bl), np.linalg.norm(tr-tl)))
-        h = int(max(np.linalg.norm(tr-br), np.linalg.norm(tl-bl)))
-        dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype="float32")
-        M = cv2.getPerspectiveTransform(rect, dst)
-        return cv2.warpPerspective(roi, M, (w, h))
-    return roi
+# ───── améliorations image ────
+def enhance_bw(img):
+    lab=cv2.cvtColor(img,cv2.COLOR_BGR2LAB)
+    l,a,b=cv2.split(lab)
+    l=cv2.createCLAHE(2.0,(16,16)).apply(l)
+    img=cv2.cvtColor(cv2.merge((l,a,b)),cv2.COLOR_LAB2BGR)
+    # suppression ombre
+    bg=cv2.blur(img,(101,101))
+    norm=cv2.divide(img,bg,scale=255)
+    gray=cv2.cvtColor(norm,cv2.COLOR_BGR2GRAY)
+    bw=cv2.adaptiveThreshold(gray,255,
+                             cv2.ADAPTIVE_THRESH_MEAN_C,
+                             cv2.THRESH_BINARY,35,8)
+    if np.mean(bw[:30,:30])<128: bw=cv2.bitwise_not(bw)
+    return crop_to_grid(bw)
 
-# ---------- Rogner marges blanches ----------
-def crop_to_grid(gray: np.ndarray) -> np.ndarray:
-    h, w = gray.shape
-    _, bw = cv2.threshold(gray, 0, 255,
-                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    rows = (bw < 200).sum(1)
-    cols = (bw < 200).sum(0)
-    top   = next(i for i,v in enumerate(rows) if v > 0.05*w)
-    bottom= h-1 - next(i for i,v in enumerate(rows[::-1]) if v > 0.05*w)
-    left  = next(i for i,v in enumerate(cols) if v > 0.05*h)
-    right = w-1 - next(i for i,v in enumerate(cols[::-1]) if v > 0.05*h)
-    return gray[top:bottom+1, left:right+1]
+# ───── pipeline complet ─────
+def process(img):
+    # rotation portrait → paysage
+    if img.shape[0] > img.shape[1]:
+        img=cv2.rotate(img,cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-# ---------- Enhance + B&W ----------
-def enhance_and_binarise(img_bgr: np.ndarray) -> np.ndarray:
-    lab   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    l,a,b = cv2.split(lab)
-    l     = cv2.createCLAHE(3.0,(8,8)).apply(l)
-    enh   = cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_LAB2BGR)
-    bg    = cv2.morphologyEx(enh, cv2.MORPH_CLOSE,
-                             cv2.getStructuringElement(cv2.MORPH_RECT,(31,31)))
-    div   = cv2.divide(enh, bg, scale=255)
-    gray  = cv2.cvtColor(div, cv2.COLOR_BGR2GRAY)
+    bbox=detect_grid(img)
+    roi = (img[bbox["y"]:bbox["y"]+bbox["h"],
+               bbox["x"]:bbox["x"]+bbox["w"]]
+           if bbox else img)
+    if bbox: roi=four_point_warp(roi,bbox["poly"])
+    out=enhance_bw(roi)
+    return out
 
-    _, bw = cv2.threshold(gray, 0, 255,
-                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw[:30, :30]) < 128:
-        bw = cv2.bitwise_not(bw)
+# ───── Routes HTTP ─────
+@app.route("/",methods=["GET"])
+def index():
+    return "<h3>ECG API Vision prête.</h3>"
 
-    bw = crop_to_grid(bw)
-    return bw
-
-# ---------- Pipeline global ----------
-def process_ecg(img_bgr: np.ndarray):
-    # 1. orientation
-    if img_bgr.shape[0] > img_bgr.shape[1]:
-        img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    # 2. Vision → bbox ou None
-    bbox = detect_grid_openai(img_bgr)
-    roi  = (img_bgr[bbox["y"]:bbox["y"]+bbox["h"],
-                    bbox["x"]:bbox["x"]+bbox["w"]]
-            if bbox else hsv_fallback(img_bgr))
-
-    # 3. warp + traitement
-    roi  = perspective_or_bbox(roi)
-    bw   = enhance_and_binarise(roi)
-    return bw, bbox
-
-# ─────────────── ROUTES ───────────────
-@app.route("/", methods=["GET"])
-def home():
-    return "<h3>ECG API (GPT‑4o Vision) opérationnelle.</h3>"
-
-@app.route("/process", methods=["POST"])
-def process_route():
+@app.route("/process",methods=["POST"])
+def proc():
     if "image" not in request.files:
-        return jsonify(error="champ 'image' manquant"), 400
-    data = request.files["image"].read()
-    img  = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return jsonify(error="image illisible"), 400
+        return jsonify(error="image manquante"),400
+    data=request.files["image"].read()
+    img=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
+    if img is None: return jsonify(error="image illisible"),400
+    out=process(img)
+    _,buf=cv2.imencode(".png",out)
+    return send_file(BytesIO(buf.tobytes()),
+                     mimetype="image/png")
 
-    bw, bbox = process_ecg(img)
-    ok, buf  = cv2.imencode(".png", bw)
-    if not ok:
-        return jsonify(error="encodage PNG raté"), 500
-    bio = BytesIO(buf.tobytes())
-    resp = send_file(bio, mimetype="image/png")
-    if bbox:
-        resp.headers["X-Grid-Bbox"] = ",".join(map(str, bbox.values()))
-    return resp
-
-# ─────────────── MAIN (débogage local) ────────────
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT",8080)),debug=False)
