@@ -1,9 +1,12 @@
 """
-ECG API – Flask + OpenCV + OpenAI Vision (auto‑compatible)
-Auteur : spripon – avril 2025
+ECG‑API  –  Flask + OpenCV + OpenAI Vision
+Version : avril 2025 – spripon
+Fonctions :
+  • rotation automatique portrait → paysage
+  • GPT‑4o Vision → polygone du quadrillage (bande blanche & marges ignorées)
+  • crop + warp + contraste + dé‑shadow + binarisation propre
 """
 
-# ─────────────────── IMPORTS ───────────────────
 import os, base64, json, cv2, numpy as np
 from io import BytesIO
 from flask import Flask, request, send_file, jsonify
@@ -12,7 +15,7 @@ from openai import OpenAI
 
 # ─────────────────── CONFIG ────────────────────
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-PREFERRED_MODEL = os.getenv("MODEL_NAME", "gpt-4o")   # valeur sûre
+PREFERRED_MODEL = os.getenv("MODEL_NAME", "gpt-4o")
 MAX_DIM_VISION  = int(os.getenv("VISION_MAX_DIM", "1600"))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -22,24 +25,21 @@ CANDIDATE_MODELS = [
 ]
 
 def pick_first_available_model() -> str | None:
-    """Renvoie le premier modèle Vision accessible sur votre compte."""
     if client is None:
         return None
     try:
         remote = {m.id for m in client.models.list().data}
     except Exception:
         remote = set()
-    # 1) par présence dans la liste
     for m in CANDIDATE_MODELS:
         if m in remote:
             return m
-    # 2) par ping 1‑token (gratuit)
+    # dernier recours : ping 1 token
     for m in CANDIDATE_MODELS:
         try:
             client.chat.completions.create(
                 model=m,
-                messages=[{"role": "user",
-                           "content": [{"type": "text", "text": "ping"}]}],
+                messages=[{"role":"user","content":[{"type":"text","text":"ping"}]}],
                 max_tokens=1
             )
             return m
@@ -51,21 +51,20 @@ VISION_MODEL = pick_first_available_model()
 print(("✅  Modèle Vision : " + VISION_MODEL)
       if VISION_MODEL else "⚠️  Aucun modèle Vision ; fallback HSV")
 
-# ─────────────────── FLASK APP ───────────────────
+# ───────────────── FLASK APP ───────────────────
 app = Flask(__name__)
-CORS(app)               # accès libre depuis Lovable.dev
+CORS(app)   # ouvert pour Lovable.dev
 
-# ──────────── UTILITAIRES OPENCV ────────────────
+# ───────── UTILITAIRES OPENCV ──────────
 def order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s, d = pts.sum(axis=1), np.diff(pts, axis=1)
+    rect = np.zeros((4,2), dtype="float32")
+    s, d = pts.sum(1), np.diff(pts, axis=1)
     rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
     rect[1], rect[3] = pts[np.argmin(d)], pts[np.argmax(d)]
     return rect
 
-# ─────────── 1. DÉTECTION VIA VISION ────────────
+# ---------- Vision : polygon ----------
 def detect_grid_openai(img_bgr: np.ndarray) -> dict | None:
-    """Renvoie {x,y,w,h} si Vision dispo, sinon None."""
     if VISION_MODEL is None:
         return None
 
@@ -85,28 +84,38 @@ def detect_grid_openai(img_bgr: np.ndarray) -> dict | None:
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text",
-             "text": ("Localise la plus grande zone contenant le quadrillage ECG "
-                      "(rose, jaune ou orange) où l’on voit D1‑D3, aVR‑aVF, V1‑V6. "
-                      "Réponds uniquement par le JSON {\"x\":int,\"y\":int,\"w\":int,"
-                      "\"h\":int}.")},
-            {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{b64}"}}
+            {"type":"text",
+             "text":(
+                 "Repère sur la photo UNIQUEMENT la zone quadrillée rose/orange "
+                 "où l’on voit les 12 dérivations ECG (D1‑D3, aVR‑aVF, V1‑V6). "
+                 "Ignore la bande blanche du haut, les marges latérales et le bas "
+                 "qui ne présentent pas de quadrillage. "
+                 "Réponds EXCLUSIVEMENT par un objet JSON "
+                 "{\"points\":[{\"x\":int,\"y\":int},…]} contenant 4 à 8 sommets "
+                 "dans l’ordre horaire."
+             )},
+            {"type":"image_url",
+             "image_url":{"url":f"data:image/png;base64,{b64}"}}
         ]
     }]
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "set_bbox",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer"},
-                    "y": {"type": "integer"},
-                    "w": {"type": "integer"},
-                    "h": {"type": "integer"}
-                },
-                "required": ["x", "y", "w", "h"]
+
+    tools=[{
+        "type":"function",
+        "function":{
+            "name":"set_grid",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "points":{
+                        "type":"array",
+                        "items":{
+                            "type":"object",
+                            "properties":{"x":{"type":"integer"},
+                                          "y":{"type":"integer"}},
+                            "required":["x","y"]},
+                        "minItems":4,
+                        "maxItems":8}},
+                "required":["points"]
             }
         }
     }]
@@ -116,35 +125,40 @@ def detect_grid_openai(img_bgr: np.ndarray) -> dict | None:
             model=VISION_MODEL,
             messages=messages,
             tools=tools,
-            tool_choice={"type": "function", "function": {"name": "set_bbox"}},
+            tool_choice={"type":"function","function":{"name":"set_grid"}},
             temperature=0
         )
         call = rsp.choices[0].message.tool_calls[0]
-        # .arguments peut être un str JSON ou déjà un dict selon la version
         args = call.function.arguments
-        if isinstance(args, str):      # vieille version du SDK
-            bbox = json.loads(args)
-        else:
-            bbox = args
-        for k in bbox:
-            bbox[k] = int(bbox[k] / scale)
-        return bbox
+        if isinstance(args, str):
+            args = json.loads(args)
+        pts = args.get("points", [])
+        if len(pts) < 4:
+            return None
+        xs = [p["x"] for p in pts]; ys = [p["y"] for p in pts]
+        x, y = min(xs), min(ys)
+        w, h = max(xs)-x, max(ys)-y
+        # filtre : aire ≥20 % et ratio largeur/hauteur raisonnable
+        if w*h < 0.20*w0*h0 or w/h > 2.2:
+            return None
+        return {"x": int(x/scale), "y": int(y/scale),
+                "w": int(w/scale), "h": int(h/scale)}
     except Exception as e:
         print("Vision API error:", e)
         return None
 
-# ─────────── 2. FALLBACK COULEUR HSV ────────────
+# ---------- Fallback HSV ----------
 def hsv_fallback(img_bgr: np.ndarray) -> np.ndarray:
-    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    blur = cv2.GaussianBlur(img_bgr, (5,5), 0)
     hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     sat, val = 20, 90
     ranges = [
-        ([  0, sat, val], [ 15, 255, 255]),
-        ([165, sat, val], [180, 255, 255]),
-        ([ 16, sat, val], [ 45, 255, 255])
+        ([  0, sat, val], [15, 255,255]),
+        ([165, sat, val], [180,255,255]),
+        ([ 16, sat, val], [45, 255,255])
     ]
     mask = None
-    for lo, hi in ranges:
+    for lo,hi in ranges:
         cur = cv2.inRange(hsv, np.array(lo), np.array(hi))
         mask = cur if mask is None else cv2.bitwise_or(mask, cur)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8), 3)
@@ -154,15 +168,15 @@ def hsv_fallback(img_bgr: np.ndarray) -> np.ndarray:
     x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
     return img_bgr[y:y+h, x:x+w]
 
-# ─────────── 3. PERSPECTIVE / WARP ──────────────
+# ---------- Perspective ----------
 def perspective_or_bbox(roi: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     cnts,_ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return roi
-    c = max(cnts, key=cv2.contourArea)
-    peri  = cv2.arcLength(c, True)
-    approx= cv2.approxPolyDP(c, 0.02 * peri, True)
+    c   = max(cnts, key=cv2.contourArea)
+    peri= cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02*peri, True)
     if len(approx) == 4:
         rect = order_points(np.array([p[0] for p in approx]))
         (tl,tr,br,bl) = rect
@@ -173,34 +187,59 @@ def perspective_or_bbox(roi: np.ndarray) -> np.ndarray:
         return cv2.warpPerspective(roi, M, (w, h))
     return roi
 
-# ─────────── 4. AMÉLIORATION + BINAIRE ──────────
+# ---------- Rogner marges blanches ----------
+def crop_to_grid(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape
+    _, bw = cv2.threshold(gray, 0, 255,
+                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    rows = (bw < 200).sum(1)
+    cols = (bw < 200).sum(0)
+    top   = next(i for i,v in enumerate(rows) if v > 0.05*w)
+    bottom= h-1 - next(i for i,v in enumerate(rows[::-1]) if v > 0.05*w)
+    left  = next(i for i,v in enumerate(cols) if v > 0.05*h)
+    right = w-1 - next(i for i,v in enumerate(cols[::-1]) if v > 0.05*h)
+    return gray[top:bottom+1, left:right+1]
+
+# ---------- Enhance + B&W ----------
 def enhance_and_binarise(img_bgr: np.ndarray) -> np.ndarray:
     lab   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     l,a,b = cv2.split(lab)
-    l     = cv2.createCLAHE(3.0, (8,8)).apply(l)
+    l     = cv2.createCLAHE(3.0,(8,8)).apply(l)
     enh   = cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_LAB2BGR)
     bg    = cv2.morphologyEx(enh, cv2.MORPH_CLOSE,
                              cv2.getStructuringElement(cv2.MORPH_RECT,(31,31)))
     div   = cv2.divide(enh, bg, scale=255)
     gray  = cv2.cvtColor(div, cv2.COLOR_BGR2GRAY)
-    return cv2.adaptiveThreshold(gray, 255,
-                                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY_INV, 15, 2)
 
-# ─────────── PIPELINE COMPLET ────────────────
+    _, bw = cv2.threshold(gray, 0, 255,
+                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw[:30, :30]) < 128:
+        bw = cv2.bitwise_not(bw)
+
+    bw = crop_to_grid(bw)
+    return bw
+
+# ---------- Pipeline global ----------
 def process_ecg(img_bgr: np.ndarray):
+    # 1. orientation
+    if img_bgr.shape[0] > img_bgr.shape[1]:
+        img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # 2. Vision → bbox ou None
     bbox = detect_grid_openai(img_bgr)
     roi  = (img_bgr[bbox["y"]:bbox["y"]+bbox["h"],
                     bbox["x"]:bbox["x"]+bbox["w"]]
             if bbox else hsv_fallback(img_bgr))
+
+    # 3. warp + traitement
     roi  = perspective_or_bbox(roi)
     bw   = enhance_and_binarise(roi)
     return bw, bbox
 
-# ─────────── ROUTES HTTP ────────────────────
+# ─────────────── ROUTES ───────────────
 @app.route("/", methods=["GET"])
 def home():
-    return "<h3>API ECG + OpenAI Vision opérationnelle.</h3>"
+    return "<h3>ECG API (GPT‑4o Vision) opérationnelle.</h3>"
 
 @app.route("/process", methods=["POST"])
 def process_route():
@@ -221,7 +260,7 @@ def process_route():
         resp.headers["X-Grid-Bbox"] = ",".join(map(str, bbox.values()))
     return resp
 
-# ─────────────────── MAIN ────────────────────
+# ─────────────── MAIN (débogage local) ────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False)
