@@ -86,11 +86,11 @@ def detect_grid_corners(img):
     upper_red1 = np.array([20, 150, 255])
     lower_red2 = np.array([160, 20, 180])
     upper_red2 = np.array([179, 150, 255])
-    
+
     # Jaune/Orange
     lower_yellow = np.array([20, 20, 180])
     upper_yellow = np.array([40, 150, 255])
-    
+
     # Orange
     lower_orange = np.array([10, 50, 180])
     upper_orange = np.array([25, 150, 255])
@@ -100,7 +100,7 @@ def detect_grid_corners(img):
     mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
     mask_orange = cv2.inRange(hsv, lower_orange, upper_orange)
-    
+
     # Combiner tous les masques
     mask_combined = cv2.bitwise_or(mask_red1, mask_red2)
     mask_combined = cv2.bitwise_or(mask_combined, mask_yellow)
@@ -138,7 +138,9 @@ def detect_grid_corners(img):
     corners = cv2.dilate(corners, None)
 
     # Créer un masque pour ne considérer que les coins dans la région d'intérêt
-    corners_roi = cv2.bitwise_and(corners > 0.01 * corners.max(), mask_roi)
+    # Convertir le résultat booléen en uint8 avant d'appliquer bitwise_and
+    corner_threshold = np.uint8((corners > 0.01 * corners.max()) * 255)
+    corners_roi = cv2.bitwise_and(corner_threshold, mask_roi)
 
     # Convertir les positions des coins en coordonnées
     corner_points = np.argwhere(corners_roi > 0)
