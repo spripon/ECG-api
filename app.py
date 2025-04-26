@@ -21,38 +21,43 @@ def order(pts):
     return rect
 
 def warp(img, poly):
-    pts = np.array([[p["x"],p["y"]] for p in poly],dtype="float32")
-    if pts.shape[0]!=4:
+    # Convertir les points en tableau numpy
+    pts = np.array([[p["x"], p["y"]] for p in poly], dtype="float32")
+    
+    # Si moins de 4 points, utiliser le rectangle minimum englobant
+    if pts.shape[0] != 4:
         pts = cv2.boxPoints(cv2.minAreaRect(pts)).astype("float32")
     
-    # Ordonner les points
+    # Ordonner les points (haut-gauche, haut-droite, bas-droite, bas-gauche)
     rect = order(pts)
-    (tl, tr, br, bl) = rect
     
     # Calculer les dimensions du rectangle de sortie
-    # Utiliser la distance euclidienne pour obtenir des mesures plus précises
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    # Utiliser la largeur et hauteur maximales pour garantir un rectangle parfait
+    widthA = np.sqrt(((rect[2][0] - rect[3][0]) ** 2) + ((rect[2][1] - rect[3][1]) ** 2))
+    widthB = np.sqrt(((rect[1][0] - rect[0][0]) ** 2) + ((rect[1][1] - rect[0][1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
     
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    heightA = np.sqrt(((rect[1][0] - rect[2][0]) ** 2) + ((rect[1][1] - rect[2][1]) ** 2))
+    heightB = np.sqrt(((rect[0][0] - rect[3][0]) ** 2) + ((rect[0][1] - rect[3][1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
     
-    # Construire le rectangle de destination avec des angles droits
+    # Construire le rectangle de destination avec des angles parfaitement droits
     dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
+        [0, 0],                      # haut-gauche
+        [maxWidth - 1, 0],           # haut-droite
+        [maxWidth - 1, maxHeight - 1], # bas-droite
+        [0, maxHeight - 1]           # bas-gauche
     ], dtype="float32")
     
-    # Calculer la matrice de transformation et appliquer la correction de perspective
+    # Calculer la matrice de transformation homographique
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
     
-    # Appliquer un léger filtrage pour réduire les artefacts potentiels
-    warped = cv2.GaussianBlur(warped, (3, 3), 0)
+    # Appliquer la transformation de perspective avec interpolation cubique
+    # pour une meilleure qualité d'image
+    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight), 
+                                flags=cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(255, 255, 255))
     
     return warped
 
