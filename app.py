@@ -56,44 +56,42 @@ def warp(img, poly):
     
     return warped
 
-# ---- colour detection optimisée ----
+# ---- colour detection ----
 def detect_color(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # Définition des plages de couleurs "rougeâtres"
+    # Plages HSV élargies pour détecter toutes les nuances rougeâtres
     # Rouge et rouge pâle (deux plages car le rouge est à cheval sur 0/180)
-    lower_red1, upper_red1 = np.array([0, 30, 50]), np.array([20, 255, 255])
-    lower_red2, upper_red2 = np.array([160, 30, 50]), np.array([179, 255, 255])
-    
-    # Rose et rose pâle
-    lower_pink, upper_pink = np.array([140, 30, 50]), np.array([170, 255, 255])
+    lower_red1, upper_red1 = np.array([0, 20, 50]), np.array([20, 255, 255])
+    lower_red2, upper_red2 = np.array([160, 20, 50]), np.array([179, 255, 255])
     
     # Orange et orange pâle
-    lower_orange, upper_orange = np.array([5, 30, 50]), np.array([25, 255, 255])
+    lower_orange, upper_orange = np.array([15, 20, 50]), np.array([30, 255, 255])
+    
+    # Rose et rose pâle
+    lower_pink, upper_pink = np.array([140, 20, 50]), np.array([170, 255, 255])
     
     # Jaune pâle
-    lower_yellow, upper_yellow = np.array([20, 30, 50]), np.array([35, 255, 255])
+    lower_yellow, upper_yellow = np.array([25, 20, 50]), np.array([35, 255, 255])
     
-    # Création des masques pour chaque plage de couleur
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_pink = cv2.inRange(hsv, lower_pink, upper_pink)
-    mask_orange = cv2.inRange(hsv, lower_orange, upper_orange)
-    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    # Combiner tous les masques
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask3 = cv2.inRange(hsv, lower_orange, upper_orange)
+    mask4 = cv2.inRange(hsv, lower_pink, upper_pink)
+    mask5 = cv2.inRange(hsv, lower_yellow, upper_yellow)
     
-    # Combinaison de tous les masques
-    mask = mask_red1 | mask_red2 | mask_pink | mask_orange | mask_yellow
+    mask = mask1 | mask2 | mask3 | mask4 | mask5
     
     # Opérations morphologiques pour nettoyer le masque
-    kernel = np.ones((25, 25), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
     
     # Trouver les contours
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+    if not cnts: 
         return None
     
-    # Sélectionner le plus grand contour
+    # Prendre le plus grand contour
     pts = cv2.boxPoints(cv2.minAreaRect(max(cnts, key=cv2.contourArea))).astype(int)
     xs, ys = pts[:, 0], pts[:, 1]
     
@@ -106,104 +104,72 @@ def detect_color(img):
 # ---- Vision fallback ----
 def detect_vision(img):
     if client is None: return None
-    h,w = img.shape[:2]; scale=1
-    if max(h,w)>MAX_DIM:
-        scale=MAX_DIM/max(h,w)
-        img=cv2.resize(img,(int(w*scale),int(h*scale)))
-    _,buf=cv2.imencode(".png",img)
-    b64=base64.b64encode(buf).decode()
-    msg=[{"role":"user","content":[
-        {"type":"text","text":"Donne 4‑8 points de la zone quadrillée ECG."},
-        {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}}]}]
-    tools=[{"type":"function","function":{"name":"set","parameters":{
-        "type":"object","properties":{
-            "points":{"type":"array","items":{
-                "type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},
-                "required":["x","y"]},"minItems":4,"maxItems":8}},
-            "required":["points"]}}}]
-    r=client.chat.completions.create(model=VISION_MODEL,messages=msg,tools=tools,
-        tool_choice={"type":"function","function":{"name":"set"}},temperature=0)
-    args=r.choices[0].message.tool_calls[0].function.arguments
-    if isinstance(args,str): args=json.loads(args)
-    pts=args["points"]
-    return {"poly":[{"x":p["x"]/scale,"y":p["y"]/scale} for p in pts]}
+    h, w = img.shape[:2]; scale = 1
+    if max(h, w) > MAX_DIM:
+        scale = MAX_DIM / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+    _, buf = cv2.imencode(".png", img)
+    b64 = base64.b64encode(buf).decode()
+    msg = [{"role": "user", "content": [
+        {"type": "text", "text": "Donne 4‑8 points de la zone quadrillée ECG."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}]
+    tools = [{"type": "function", "function": {"name": "set", "parameters": {
+        "type": "object", "properties": {
+            "points": {"type": "array", "items": {
+                "type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                "required": ["x", "y"]}, "minItems": 4, "maxItems": 8}},
+        "required": ["points"]}}}]
+    r = client.chat.completions.create(model=VISION_MODEL, messages=msg, tools=tools,
+        tool_choice={"type": "function", "function": {"name": "set"}}, temperature=0)
+    args = r.choices[0].message.tool_calls[0].function.arguments
+    if isinstance(args, str): args = json.loads(args)
+    pts = args["points"]
+    return {"poly": [{"x": p["x"] / scale, "y": p["y"] / scale} for p in pts]}
 
-# ---- Filtre argenté optimisé avec vos paramètres ----
+# ---- iPhone‑like enhancement ----
 def enhance(img):
-    # Exposition +20%
-    img = cv2.convertScaleAbs(img, alpha=1.2, beta=0)
+    # exposition + brillance (augmentation du contraste de 20% supplémentaire)
+    exp = cv2.convertScaleAbs(img, alpha=1.4, beta=20)  # Alpha augmenté de 1.2 à 1.4
     
-    # Brillance +15%
-    brightness = np.ones(img.shape, dtype="uint8") * 15
-    img = cv2.add(img, brightness)
+    # désaturation
+    hsv = cv2.cvtColor(exp, cv2.COLOR_BGR2HSV)
+    hsv[:, :, 1] = (hsv[:, :, 1] * 0.5).astype(np.uint8)
+    exp = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     
-    # Ombres +80%
-    # Simuler l'augmentation des ombres en ajustant les zones sombres
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    v = hsv[:,:,2]
-    # Augmenter les valeurs sombres mais pas les valeurs claires
-    shadow_mask = v < 128
-    v[shadow_mask] = np.clip(v[shadow_mask] * 1.8, 0, 255).astype(np.uint8)
-    hsv[:,:,2] = v
-    img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    # suppression des ombres
+    bg = cv2.medianBlur(exp, 51)
+    flat = cv2.divide(exp, bg, scale=255)
     
-    # Contraste +25%
-    mean = np.mean(img)
-    img = np.clip((img - mean) * 1.25 + mean, 0, 255).astype(np.uint8)
-    
-    # Luminosité -30%
-    img = cv2.convertScaleAbs(img, alpha=1.0, beta=-30)
-    
-    # Point noir +90% (augmenter les noirs)
-    # Simuler l'effet en ajustant les valeurs sombres
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    v = hsv[:,:,2]
-    # Réduire les valeurs très sombres
-    black_mask = v < 50
-    v[black_mask] = np.clip(v[black_mask] * 0.1, 0, 255).astype(np.uint8)
-    hsv[:,:,2] = v
-    img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    
-    # Effet argenté (désaturation partielle et ajustement des tons)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    # Réduire la saturation pour l'effet argenté
-    hsv[:,:,1] = (hsv[:,:,1] * 0.7).astype(np.uint8)
-    # Ajuster légèrement la teinte pour un effet plus froid/argenté
-    hsv[:,:,0] = np.clip(hsv[:,:,0] + 5, 0, 179).astype(np.uint8)
-    img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    
-    # Sharpen pour améliorer la netteté
-    kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    img = cv2.filter2D(img, -1, kernel)
-    
-    return img
+    # sharpen
+    sh = cv2.addWeighted(flat, 1.3, cv2.GaussianBlur(flat, (0, 0), 3), -0.3, 0)
+    return sh
 
 # ---- pipeline ----
 def process(img):
-    if img.shape[0]>img.shape[1]:
-        img=cv2.rotate(img,cv2.ROTATE_90_COUNTERCLOCKWISE)
-    box=detect_color(img) or detect_vision(img)
+    if img.shape[0] > img.shape[1]:
+        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    box = detect_color(img) or detect_vision(img)
     if not box: raise ValueError("zone non trouvée")
-    roi = warp(img,box["poly"])
+    roi = warp(img, box["poly"])
     return enhance(roi)
 
 # ---- Flask ----
-app=Flask(__name__); CORS(app)
+app = Flask(__name__); CORS(app)
 
-@app.route("/process",methods=["POST"])
+@app.route("/process", methods=["POST"])
 def handle():
     if "image" not in request.files:
-        return jsonify(error="image?"),400
-    img=cv2.imdecode(np.frombuffer(request.files["image"].read(),np.uint8),
-                     cv2.IMREAD_COLOR)
+        return jsonify(error="image?"), 400
+    img = cv2.imdecode(np.frombuffer(request.files["image"].read(), np.uint8),
+        cv2.IMREAD_COLOR)
     try:
-        out=process(img);_,buf=cv2.imencode(".png",out)
-        return send_file(BytesIO(buf.tobytes()),mimetype="image/png")
+        out = process(img); _, buf = cv2.imencode(".png", out)
+        return send_file(BytesIO(buf.tobytes()), mimetype="image/png")
     except Exception as e:
-        return jsonify(error=str(e)),500
+        return jsonify(error=str(e)), 500
 
 @app.route("/")
 def home(): return "<h3>ECG‑API filtre argenté</h3>"
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT",8080)),debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), debug=False)
